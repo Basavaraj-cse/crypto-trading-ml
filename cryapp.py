@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-import crypto
+import cry as crypto
 
 st.set_page_config(page_title="Crypto signal")
 

@@ -17,7 +17,7 @@ except Exception:
 
 BASE = os.getenv("BINANCE_BASE", "https://data-api.binance.vision")   # free, no key
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-DATA_FILE = os.getenv("DATA_FILE", "BTCUSDT-trades-2026-10-11.csv")
+DATA_FILE = os.getenv("DATA_FILE", "BTCUSDT-trades-2026-10-12.csv")
 NAMES = {0: "SELL", 1: "HOLD", 2: "BUY"}
 FEATS = ["ret_1", "ret_5", "vol_20", "flow", "flow_5", "log_qty"]
 
@@ -42,21 +42,37 @@ def load_trades(file, nrows=None):
 # 2) BARS: group trades into small time bars (1 row per few seconds)
 def to_bars(d, sec=1):
     d = d.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+    d["price"] = pd.to_numeric(d["price"], errors="coerce")
+    d["quantity"] = pd.to_numeric(d["quantity"], errors="coerce")
     d["buy"] = np.where(d["side"] == "buy", d["quantity"], 0.0)
-    g = d.set_index("timestamp").resample(f"{sec}s")
-    b = pd.DataFrame({"price": g["price"].last(), "qty": g["quantity"].sum(),
-                      "buy": g["buy"].sum(), "n": g["price"].count()})
-    return b[b["n"] > 0].reset_index()
 
+    d = d.dropna(subset=["timestamp", "price", "quantity"])
+    if d.empty:
+        return pd.DataFrame(
+            columns=["timestamp", "price", "qty", "buy", "n"]
+        )
+
+    b = d.set_index("timestamp").resample(f"{sec}s").agg(
+        price=("price", "last"),
+        qty=("quantity", "sum"),
+        buy=("buy", "sum"),
+        n=("price", "count")
+    )
+
+    return b[b["n"] > 0].reset_index()
 
 # 3) FEATURES: numbers the model learns from
 def features(b):
-    b["ret_1"] = b["price"].pct_change()                   # last price change
-    b["ret_5"] = b["price"].pct_change(5)                  # change over 5 bars
-    b["vol_20"] = b["ret_1"].rolling(20).std()             # volatility
-    b["flow"] = 2 * b["buy"] / b["qty"] - 1                # +1 all buying, -1 all selling
-    b["flow_5"] = b["flow"].rolling(5).mean()
-    b["log_qty"] = np.log1p(b["qty"])                      # trade volume
+    b = b.copy()
+
+    b["ret_1"] = b["price"].pct_change()
+    b["ret_5"] = b["price"].pct_change(5)
+    b["vol_20"] = b["ret_1"].rolling(20, min_periods=2).std()
+    b["flow"] = 2 * b["buy"] / b["qty"].replace(0, np.nan) - 1
+    b["flow_5"] = b["flow"].rolling(5, min_periods=1).mean()
+    b["log_qty"] = np.log1p(b["qty"].clip(lower=0))
+
     return b
 
 
@@ -80,24 +96,47 @@ def train(b, model, ahead=10, tail=0.25, test=0.3):
     label = lambda x: np.where(x["future"] > hi, 2, np.where(x["future"] < lo, 0, 1))
     model.fit(tr[FEATS], label(tr))
     acc = (model.predict(te[FEATS]) == label(te)).mean()
-    base = pd.Series(label(te)).value_counts(normalize=True).max()   # "always guess most common"
+    base = pd.Series(label(tr)).value_counts(normalize=True).max()   # "always guess most common"
     return acc, base
 
 
 # 5) LIVE: free Binance API -> same features -> predict
 def live_signal(model, sec=1):
-    r = requests.get(f"{BASE}/api/v3/trades", params={"symbol": SYMBOL, "limit": 1000}, timeout=10)
+    r = requests.get(
+        f"{BASE}/api/v3/trades",
+        params={"symbol": SYMBOL, "limit": 10000},
+        timeout=15,
+    )
     r.raise_for_status()
+
     d = pd.DataFrame(r.json())
+    if d.empty:
+        raise ValueError("Binance returned no recent trades.")
+
     d["timestamp"] = pd.to_datetime(d["time"], unit="ms")
-    d["price"], d["quantity"] = d["price"].astype(float), d["qty"].astype(float)
+    d["price"] = d["price"].astype(float)
+    d["quantity"] = d["qty"].astype(float)
     d["side"] = np.where(d["isBuyerMaker"], "sell", "buy")
-    live = features(to_bars(d, sec)).dropna(subset=FEATS)
-    last = live.iloc[[-1]]
-    p = model.predict_proba(last[FEATS])[0]
-    return NAMES[int(model.classes_[p.argmax()])], float(p.max()), float(last["price"].iloc[0])
 
+    live = features(to_bars(d, sec))
 
+    live = live.replace([np.inf, -np.inf], np.nan)
+    live = live.dropna(subset=FEATS)
+
+    if len(live) == 0:
+        raise ValueError(
+          "Not enough recent trades to build features. "
+          "Try a smaller Bar seconds value."
+        )
+
+    last = live.iloc[-1]
+    p = model.predict_proba(last[FEATS].to_frame().T)[0]
+
+    signal = NAMES[int(model.classes_[p.argmax()])]
+    confidence = float(p.max())
+    price = float(last["price"])
+
+    return signal, confidence, price
 # 6) PAPER TRADE: fake-money suggestion (never places real orders)
 def paper_plan(signal, price, cash=1000.0, risk_pct=10):
     spend = cash * risk_pct / 100
